@@ -1,0 +1,6 @@
+---
+- name: Prepare MobilePark hosts
+  hosts: mobilepark
+  become: true
+  roles:
+    - common

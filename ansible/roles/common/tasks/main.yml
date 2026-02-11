@@ -1,0 +1,9 @@
+---
+- name: Prepare
+  ansible.builtin.import_tasks: prepare.yml
+
+- name: Manage users and ssh access
+  ansible.builtin.import_tasks: users.yml
+
+- name: Install and configure docker
+  ansible.builtin.import_tasks: docker.yml

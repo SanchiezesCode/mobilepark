@@ -1,0 +1,202 @@
+---
+- name: Init cluster docker swarm MobilePark
+  hosts: mobilepark
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Install python3-pip
+      ansible.builtin.apt:
+        name: python3-pip
+        state: present
+        update_cache: true
+
+    - name: Install Docker SDK for Python
+      ansible.builtin.pip:
+        name:
+          - docker
+          - jsondiff
+        state: present
+        executable: pip3
+      become: true
+
+
+- name: Init cluster docker swarm managers
+  hosts: managers
+  become: true
+  gather_facts: false
+  run_once: false
+
+  vars:
+    first_manager: "{{ groups.managers[0] }}"
+
+  tasks:
+    - name: Initialize Swarm on the first manager
+      community.docker.docker_swarm:
+        state: present
+        advertise_addr: "{{ ansible_host }}"
+        listen_addr: "0.0.0.0"
+        force: "{{ swarm_force_init | default(false) }}"
+      when:
+        - groups.managers | default([]) | length > 0
+        - inventory_hostname == first_manager
+      register: swarm_init
+
+    - name: Get Swarm facts and join tokens (only on first manager after init)
+      community.docker.docker_swarm_info:
+      register: swarm_facts
+      when:
+        - inventory_hostname == first_manager
+        - swarm_init is success or "'already part' in swarm_init.msg | default('')"
+      changed_when: false
+
+    - name: Set join tokens as facts (from first manager)
+      ansible.builtin.set_fact:
+        swarm_join_token_manager: "{{ swarm_facts.swarm_facts.JoinTokens.Manager }}"
+        swarm_join_token_worker: "{{ swarm_facts.swarm_facts.JoinTokens.Worker }}"
+      when: inventory_hostname == first_manager
+      delegate_to: "{{ first_manager }}"
+
+    - name: Join additional managers to the swarm
+      community.docker.docker_swarm:
+        state: join
+        advertise_addr: "{{ ansible_host }}"
+        join_token: "{{ hostvars[first_manager].swarm_join_token_manager }}"
+        remote_addrs:
+          - "{{ hostvars[first_manager].ansible_host }}:2377"  # или advertise_addr первого
+      when:
+        - inventory_hostname != first_manager
+        - hostvars[first_manager].swarm_join_token_manager is defined
+
+- name: Join workers Docker Swarm
+  hosts: workers
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Join node as worker
+      community.docker.docker_swarm:
+        state: join
+        advertise_addr: "{{ ansible_host }}"
+        join_token: "{{ hostvars[groups.managers[0]].swarm_join_token_worker }}"
+        remote_addrs:
+          - "{{ hostvars[groups.managers[0]].ansible_host }}:2377"
+      when: hostvars[groups.managers[0]].swarm_join_token_worker is defined
+
+- name: Add labels to workers
+  hosts: managers[0]  # выполняем только на одном менеджере
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Get info workers
+      community.docker.docker_node_info:
+        name: "{{ item }}"
+      register: node_infos
+      loop: "{{ groups['workers'] }}"
+
+    - name: Add SERVERTYPE label
+      community.docker.docker_node:
+        hostname: "{{ item.item }}"
+        labels:
+          SERVERTYPE: worker
+        labels_state: merge
+      when:
+        - item.nodes is defined
+        - item.nodes | length > 0
+        - "'SERVERTYPE' not in item.nodes[0].Spec.Labels"
+      loop: "{{ node_infos.results }}"
+
+- name: Verify Swarm cluster status
+  hosts: managers[0]  # выполняем только на одном менеджере
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Show Docker nodes
+      ansible.builtin.command: docker node ls
+      register: nodes
+      changed_when: false
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg: "{{ nodes.stdout_lines }}"
+
+- name: Deploy test stack inline (no external file)
+  hosts: managers[0]
+  gather_facts: false
+  become: true
+  tasks:
+  - name: Deploy inline Docker Swarm stack with postgres, redis and ubuntu app
+    community.docker.docker_stack:
+      state: present
+      name: mobilepark_app
+      compose:
+        - version: "3.9"
+          services:
+            postgres:
+              image: postgres:16
+              environment:
+                POSTGRES_USER: testuser
+                POSTGRES_PASSWORD: "{{ psql_password }}"
+                POSTGRES_DB: testdb
+              volumes:
+                - postgres-data:/var/lib/postgresql/data
+              networks:
+                - db-postgres-net
+              deploy:
+                replicas: 1
+                placement:
+                  constraints:
+                    - node.labels.SERVERTYPE == worker
+                restart_policy:
+                  condition: on-failure
+
+            redis:
+              image: redis:7-alpine
+              command: redis-server --save 60 1 --loglevel warning
+              volumes:
+                - redis-data:/data
+              networks:
+                - ds-redis-net
+              deploy:
+                replicas: 1
+                placement:
+                  constraints:
+                    - node.labels.SERVERTYPE == worker
+                restart_policy:
+                  condition: on-failure
+
+            ubuntu:
+              image: ubuntu:22.04
+              command: sleep infinity
+              deploy:
+                mode: replicated
+                replicas: 2
+                placement:
+                  constraints:
+                    - node.labels.SERVERTYPE == worker
+                update_config:
+                  parallelism: 1
+                  delay: 10s
+                  failure_action: pause
+                  monitor: 5s
+                  max_failure_ratio: 0
+                  order: start-first
+                resources:
+                  limits:
+                    cpus: "1.0"
+                    memory: 500M
+              environment:
+                - HOSTNAME={{ inventory_hostname }}
+              networks:
+                - db-postgres-net
+                - ds-redis-net
+
+          networks:
+            db-postgres-net:
+              driver: overlay
+              attachable: true
+            ds-redis-net:
+              driver: overlay
+              attachable: true
+
+          volumes:
+            postgres-data:
+            redis-data:

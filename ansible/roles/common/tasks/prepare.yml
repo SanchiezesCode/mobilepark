@@ -1,0 +1,19 @@
+---
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    upgrade: true
+    autoremove: true
+
+- name: Install required utilities
+  ansible.builtin.apt:
+    name: "{{ required_packages }}"
+    state: present
+
+- name: Set timezone
+  community.general.timezone:
+    name: Europe/Moscow
